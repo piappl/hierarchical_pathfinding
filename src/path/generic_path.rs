@@ -3,6 +3,7 @@ use super::Cost;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub struct Path<P> {
     path: Arc<[P]>,
     cost: Cost,

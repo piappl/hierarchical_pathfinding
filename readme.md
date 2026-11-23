@@ -81,3 +81,71 @@ if let Some(path) = path {
     }
 }
 ```
+
+## Fork additions
+
+This repository extends upstream `hierarchical_pathfinding` with:
+
+1. **`find_path_with_portals`** — path + the list of portals it was routed through.
+2. **`NoCornerNeighborhood`** — 8-direction movement that never cuts corners.
+3. **Graph serialization** (cargo feature `serialize`, off by default) — `to_bytes`/`from_bytes`.
+4. **`plan_portals`** — route planning on the abstract graph alone, without a cost function.
+
+## API overview
+
+### Constructing
+
+| Method | Requirements | Returns |
+|---|---|---|
+| `PathCache::new(size, get_cost, neighborhood, config)` | `get_cost: Sync + Fn(Point) -> isize` | built `PathCache` |
+| `PathCache::new_with_fn_mut(...)` | `get_cost: FnMut` (not thread-safe, single-threaded build) | built `PathCache` |
+| `PathCache::new_parallel(...)` (feature `parallel`, default) | same as `new` | built `PathCache` |
+
+Cost semantics: negative = solid, positive = cost multiplier per Tile. Chunk size comes from `PathCacheConfig::with_chunk_size(n)`.
+
+### Pathfinding
+
+| Method | Requirements | Returns |
+|---|---|---|
+| `find_path(start, goal, get_cost)` | cost closure | `Option<AbstractPath<N>>` — full path; `None` if unreachable |
+| `find_path_with_portals(start, goal, get_cost)` | same | `Option<(AbstractPath<N>, Vec<Point>)>` — path **and** portals `[start, ..., goal]`; same-chunk/cave fallback returns exactly `[start, goal]`; cost identical to `find_path` |
+| `find_paths(start, &goals, get_cost)` | slice of goals | `HashMap<Point, AbstractPath<N>>` of reachable goals |
+| `find_closest_goal(start, &goals, get_cost)` | | `Option<(Point, AbstractPath<N>)>` — cheapest of reachable goals |
+| `plan_portals(start, goal)` | **none** — no cost function needed | `Option<Vec<Point>>` — portals only, planned purely on the abstract graph. First/last portal is the nearest node of the containing chunk (ties by NodeID); **traversability of the first/last segment is NOT checked** — validate it locally. `None` for out-of-bounds or cave chunks; same-chunk/`start == goal` gives `[start, goal]` |
+
+`AbstractPath<N>`: iterate for the full point list, or `cost()`, `length()`,
+`safe_next(get_cost)` for step-by-step consumption, `resolve(get_cost)` to collect
+everything. Unresolved segments need the cost function passed in.
+
+### Updating the grid
+
+| Method | Notes |
+|---|---|
+| `tiles_changed(&tiles, get_cost)` | rebuild affected Chunks after costs changed |
+| `tiles_changed_with_fn_mut(...)` | FnMut variant |
+
+### Neighborhoods
+
+- `ManhattanNeighborhood::new(w, h)` — 4 directions.
+- `MooreNeighborhood::new(w, h)` — 8 directions, may cut corners.
+- `NoCornerNeighborhood::new(w, h, costs)` — 8 directions, diagonal blocked only when **both** orthogonal corners are solid. Unlike the others it **owns the costmap** and shares it via `hood.cost_fn()`:
+  ```rust
+  let hood = NoCornerNeighborhood::new(w, h, costs);
+  let mut pf = PathCache::new((w, h), hood.cost_fn(), hood.clone(), config);
+  // later:
+  hood.set_tile(point, cost);                       // update the map first,
+  pf.tiles_changed(&[point], hood.cost_fn());       // then rebuild the chunks
+  ```
+
+### Serialization (feature `serialize`)
+
+```toml
+hierarchical_pathfinding = { version = "...", features = ["serialize"] }
+```
+
+| Method | Requirements | Returns |
+|---|---|---|
+| `to_bytes()` | `N: Serialize` | `Vec<u8>` — header `b"HPAG"` + version byte (`1`) + bincode payload |
+| `PathCache::from_bytes(&[u8])` | same `N` as written | `Result<PathCache<N>, HpaSerError>` — errors: `TooShort`, `BadMagic`, `UnsupportedVersion(v)`, `Corrupt`; never panics on any input |
+
+A deserialized cache can be used for `plan_portals` immediately and for `find_path` once the cost function is available again (with `cache_paths: false` the segments are stored as `Unknown` and need it to resolve). Typical split: one component builds the graph and ships the bytes, a transport component forwards them untouched, the planner deserializes and runs `plan_portals`.

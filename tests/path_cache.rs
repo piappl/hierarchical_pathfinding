@@ -276,3 +276,112 @@ fn from_github_issue_7_example_2() {
 
     main();
 }
+
+type Grid20 = [[usize; 20]; 20];
+
+const COST_MAP20: [isize; 3] = [1, 10, -1];
+
+fn cost_fn20(grid: &Grid20) -> impl '_ + Fn((usize, usize)) -> isize {
+    move |(x, y)| COST_MAP20[grid[y][x]]
+}
+
+// 20x20 grid, all empty, one vertical wall in column 9 with a single gap, chunk_size 4.
+fn multichunk_wall_fixture() -> (Grid20, PathCache<ManhattanNeighborhood>) {
+    const WALL_X: usize = 9;
+    const GAP_Y: usize = 10;
+    let mut grid: Grid20 = [[0; 20]; 20];
+    for row in grid.iter_mut() {
+        row[WALL_X] = 2;
+    }
+    grid[GAP_Y][WALL_X] = 0;
+    let (width, height) = (grid[0].len(), grid.len());
+    let pathfinding = PathCache::new(
+        (width, height),
+        cost_fn20(&grid),
+        ManhattanNeighborhood::new(width, height),
+        PathCacheConfig::with_chunk_size(4),
+    );
+    (grid, pathfinding)
+}
+
+#[test]
+fn portals_multichunk_endpoints() {
+    let (grid, pathfinding) = multichunk_wall_fixture();
+    let start = (1, 1);
+    let goal = (18, 18);
+    let (path, portals) = pathfinding
+        .find_path_with_portals(start, goal, cost_fn20(&grid))
+        .unwrap();
+    assert_eq!(portals[0], start);
+    assert_eq!(*portals.last().unwrap(), goal);
+    assert!(
+        portals.len() >= 3,
+        "expected at least 3 portals, got {:?}",
+        portals
+    );
+    let _ = path;
+}
+
+#[test]
+fn portals_on_chunk_borders() {
+    const CS: usize = 4;
+    let (grid, pathfinding) = multichunk_wall_fixture();
+    let start = (1, 1);
+    let goal = (18, 18);
+    let (_path, portals) = pathfinding
+        .find_path_with_portals(start, goal, cost_fn20(&grid))
+        .unwrap();
+    assert!(portals.len() >= 3, "portals={:?}", portals);
+    for portal in &portals[1..portals.len() - 1] {
+        let (x, y) = *portal;
+        assert!(
+            x % CS == 0 || (x + 1) % CS == 0 || y % CS == 0 || (y + 1) % CS == 0,
+            "portal {:?} is not on a chunk border",
+            portal
+        );
+    }
+}
+
+#[test]
+fn portals_same_chunk_no_portals() {
+    let grid: Grid20 = [[0; 20]; 20];
+    let (width, height) = (grid[0].len(), grid.len());
+    let pathfinding = PathCache::new(
+        (width, height),
+        cost_fn20(&grid),
+        ManhattanNeighborhood::new(width, height),
+        PathCacheConfig::with_chunk_size(4),
+    );
+    let start = (1, 1);
+    let goal = (2, 2);
+    let (_path, portals) = pathfinding
+        .find_path_with_portals(start, goal, cost_fn20(&grid))
+        .unwrap();
+    assert_eq!(portals, vec![start, goal]);
+}
+
+#[test]
+fn portals_cost_matches_find_path() {
+    let (grid, pathfinding) = multichunk_wall_fixture();
+    let pairs = [
+        ((1, 1), (18, 18)), // multichunk, across the wall
+        ((1, 1), (2, 2)),   // same chunk, short route
+        ((18, 1), (1, 18)), // multichunk, other direction
+    ];
+    for (start, goal) in pairs.iter() {
+        let (path, _portals) = pathfinding
+            .find_path_with_portals(*start, *goal, cost_fn20(&grid))
+            .unwrap();
+        let expected = pathfinding
+            .find_path(*start, *goal, cost_fn20(&grid))
+            .unwrap()
+            .cost();
+        assert_eq!(
+            path.cost(),
+            expected,
+            "cost mismatch for {:?} -> {:?}",
+            start,
+            goal
+        );
+    }
+}

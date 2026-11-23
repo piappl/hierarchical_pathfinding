@@ -2,6 +2,7 @@ use super::{Cost, Path};
 use crate::Point;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub enum PathSegment {
     Known(Path<Point>),
     Unknown {

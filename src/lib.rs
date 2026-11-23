@@ -409,6 +409,14 @@
 //! In order to consume the logs, you need a logger setup to show trace! level logs.
 //! See the [log](https://crates.io/crates/log) crate for more details.
 //!
+//! ##### serialize
+//! Disabled by default.
+//!
+//! Adds `to_bytes` and `from_bytes` to `PathCache`, a versioned byte format
+//! (`HPAG` magic + version byte + `bincode` payload) for storing and
+//! transporting a built graph. See the method documentation on `PathCache`
+//! for the exact layout and error handling.
+//!
 
 /// Shorthand for a 2D Point
 type Point = (usize, usize);
@@ -429,6 +437,11 @@ type NodeIDSet = hashbrown::HashSet<NodeID>;
 mod path_cache;
 pub use self::path_cache::{PathCache, PathCacheConfig};
 
+#[cfg(feature = "serialize")]
+mod ser;
+#[cfg(feature = "serialize")]
+pub use self::ser::HpaSerError;
+
 mod path;
 
 mod utils;
@@ -447,8 +460,10 @@ pub mod internals {
 
 /// The prelude for this crate.
 pub mod prelude {
+    #[cfg(feature = "serialize")]
+    pub use crate::HpaSerError;
     pub use crate::{
-        neighbors::{ManhattanNeighborhood, MooreNeighborhood, Neighborhood},
+        neighbors::{ManhattanNeighborhood, MooreNeighborhood, Neighborhood, NoCornerNeighborhood},
         PathCache, PathCacheConfig,
     };
 }

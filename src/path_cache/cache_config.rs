@@ -42,6 +42,7 @@
 /// Can be drastically reduced by setting `cache_paths` to `false`, at the expense of repeated
 /// calculations when using a Path.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub struct PathCacheConfig {
     /// The size of the individual Chunks (defaults to `8`)
     ///

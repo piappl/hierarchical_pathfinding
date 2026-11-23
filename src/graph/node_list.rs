@@ -100,6 +100,49 @@ impl IndexMut<NodeID> for NodeList {
     }
 }
 
+#[cfg(feature = "serialize")]
+mod serialize {
+    use super::{Node, NodeList};
+    use crate::PointMap;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct NodeListRepr {
+        entries: Vec<(usize, Node)>,
+        pos_map: PointMap<usize>,
+    }
+
+    impl Serialize for NodeList {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let repr = NodeListRepr {
+                entries: self
+                    .nodes
+                    .iter()
+                    .map(|(key, node)| (key, node.clone()))
+                    .collect(),
+                pos_map: self.pos_map.iter().map(|(pos, id)| (*pos, *id)).collect(),
+            };
+            repr.serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for NodeList {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let repr = NodeListRepr::deserialize(deserializer)?;
+            let mut entries = repr.entries;
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(D::Error::custom("duplicate node key in NodeList"));
+            }
+            Ok(Self {
+                nodes: entries.into_iter().collect(),
+                pos_map: repr.pos_map,
+            })
+        }
+    }
+}
+
 #[test]
 fn absorb() {
     let mut nodes = NodeList::new();

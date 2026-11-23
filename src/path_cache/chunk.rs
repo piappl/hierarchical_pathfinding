@@ -6,6 +6,7 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct Chunk {
     pub pos: Point,
     pub size: Point,

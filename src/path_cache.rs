@@ -41,6 +41,7 @@ where
 
 /// A struct to store the Hierarchical Pathfinding information.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub struct PathCache<N: Neighborhood> {
     width: usize,
     height: usize,
@@ -446,7 +447,68 @@ impl<N: Neighborhood + Sync> PathCache<N> {
         &self,
         start: Point,
         goal: Point,
+        get_cost: impl FnMut(Point) -> isize,
+    ) -> Option<AbstractPath<N>> {
+        self.find_path_internal(start, goal, get_cost, None)
+    }
+
+    /// Same as [`find_path`](PathCache::find_path), but additionally returns the list of Portals
+    /// (waypoints) that the Path was routed through.
+    ///
+    /// The returned list always starts with `start` and ends with `goal`. Paths that need no
+    /// Portals (same-chunk cave paths or very short routes) return exactly `vec![start, goal]`.
+    /// Consecutive duplicates are removed from the list.
+    ///
+    /// ## Examples
+    /// ```
+    /// # use hierarchical_pathfinding::prelude::*;
+    /// # let mut grid = [
+    /// #     [0, 2, 0, 0, 0],
+    /// #     [0, 2, 2, 2, 2],
+    /// #     [0, 1, 0, 0, 0],
+    /// #     [0, 1, 0, 2, 0],
+    /// #     [0, 0, 0, 2, 0],
+    /// # ];
+    /// # let (width, height) = (grid[0].len(), grid.len());
+    /// # fn cost_fn(grid: &[[usize; 5]; 5]) -> impl '_ + Sync + Fn((usize, usize)) -> isize {
+    /// #     move |(x, y)| [1, 10, -1][grid[y][x]]
+    /// # }
+    /// # let pathfinding = PathCache::new(
+    /// #     (width, height),
+    /// #     cost_fn(&grid),
+    /// #     ManhattanNeighborhood::new(width, height),
+    /// #     PathCacheConfig::with_chunk_size(3),
+    /// # );
+    /// let start = (0, 0);
+    /// let goal = (4, 4);
+    /// let (path, portals) = pathfinding
+    ///     .find_path_with_portals(start, goal, cost_fn(&grid))
+    ///     .unwrap();
+    /// assert_eq!(portals[0], start);
+    /// assert_eq!(*portals.last().unwrap(), goal);
+    /// assert_eq!(
+    ///     path.cost(),
+    ///     pathfinding.find_path(start, goal, cost_fn(&grid)).unwrap().cost(),
+    /// );
+    /// ```
+    pub fn find_path_with_portals(
+        &self,
+        start: Point,
+        goal: Point,
+        get_cost: impl FnMut(Point) -> isize,
+    ) -> Option<(AbstractPath<N>, Vec<Point>)> {
+        let mut portals = PointMap::default();
+        let path = self.find_path_internal(start, goal, get_cost, Some(&mut portals))?;
+        portals.remove(&goal).map(|portals| (path, portals))
+    }
+
+    // Shared body of find_path; portals is an optional out-param filled on success.
+    fn find_path_internal(
+        &self,
+        start: Point,
+        goal: Point,
         mut get_cost: impl FnMut(Point) -> isize,
+        mut portals: Option<&mut PointMap<Vec<Point>>>,
     ) -> Option<AbstractPath<N>> {
         #[cfg(feature = "log")]
         let (outer_timer, timer) = (std::time::Instant::now(), std::time::Instant::now());
@@ -469,6 +531,9 @@ impl<N: Neighborhood + Sync> PathCache<N> {
         let neighborhood = self.neighborhood.clone();
 
         if start == goal {
+            if let Some(portals) = portals.as_mut() {
+                portals.insert(goal, vec![start]);
+            }
             return Some(AbstractPath::from_known_path(
                 neighborhood,
                 Path::from_slice(&[start, start], 0),
@@ -481,6 +546,9 @@ impl<N: Neighborhood + Sync> PathCache<N> {
             } else {
                 // no path from start to any Node => start is in cave within chunk
                 // => hope that goal is in the same cave
+                if let Some(portals) = portals.as_mut() {
+                    portals.insert(goal, vec![start, goal]);
+                }
                 return self
                     .get_chunk(start)
                     .find_path(start, goal, get_cost, &neighborhood)
@@ -521,6 +589,7 @@ impl<N: Neighborhood + Sync> PathCache<N> {
             &paths,
             get_cost,
             &mut ret_map,
+            portals,
         );
 
         re_trace!("resolve_paths", timer);
@@ -842,6 +911,7 @@ impl<N: Neighborhood + Sync> PathCache<N> {
             &paths,
             get_cost,
             &mut ret,
+            None,
         );
         ret
     }
@@ -1278,6 +1348,105 @@ impl<N: Neighborhood + Sync> PathCache<N> {
         &self.config
     }
 
+    /// Plans a route on the abstract graph only, without any cost function,
+    /// and returns the sequence of portals `[start, ..., goal]`.
+    ///
+    /// The first (last) portal is the Node of the chunk containing `start`
+    /// (`goal`) with the lowest heuristic distance to that point; ties are
+    /// broken by the lowest `NodeID`. The interior of the route is found with
+    /// the internal graph A*. Out-of-bounds points give `None`; a chunk
+    /// without any Nodes (a cave) gives `None`; `start == goal` or a
+    /// same-chunk query gives exactly `vec![start, goal]`.
+    ///
+    /// # Warning
+    ///
+    /// The first and the last portal are picked purely by nearest position:
+    /// the link from `start` to the first portal (and from the last portal to
+    /// `goal`) is NOT checked for traversability. A portal can be behind a
+    /// wall inside its own chunk (a cave). Validating or bypassing that
+    /// first/last segment is the caller's (e.g. the robot controller's)
+    /// responsibility, using its local map.
+    ///
+    /// What IS guaranteed: every interior transition between consecutive
+    /// portals corresponds to a real edge of the abstract graph (with its
+    /// cost) — the middle of the returned sequence is graph-valid.
+    ///
+    /// ## Examples
+    /// ```
+    /// # use hierarchical_pathfinding::prelude::*;
+    /// # let mut grid = [
+    /// #     [0, 2, 0, 0, 0, 0, 0, 0],
+    /// #     [0, 2, 0, 0, 0, 0, 0, 0],
+    /// #     [0, 0, 0, 2, 2, 0, 0, 0],
+    /// #     [0, 0, 0, 0, 0, 0, 0, 0],
+    /// #     [0, 0, 0, 0, 2, 2, 0, 0],
+    /// #     [0, 0, 0, 0, 0, 0, 0, 0],
+    /// #     [0, 0, 0, 0, 0, 0, 2, 0],
+    /// #     [0, 0, 0, 0, 0, 0, 0, 0],
+    /// # ];
+    /// # let (width, height) = (grid[0].len(), grid.len());
+    /// # fn cost_fn(grid: &[[usize; 8]; 8]) -> impl '_ + Sync + Fn((usize, usize)) -> isize {
+    /// #     move |(x, y)| [1, 10, -1][grid[y][x]]
+    /// # }
+    /// # let pathfinding = PathCache::new(
+    /// #     (width, height),
+    /// #     cost_fn(&grid),
+    /// #     ManhattanNeighborhood::new(width, height),
+    /// #     PathCacheConfig::with_chunk_size(4),
+    /// # );
+    /// let start = (0, 0);
+    /// let goal = (7, 7);
+    /// let portals = pathfinding.plan_portals(start, goal).unwrap();
+    /// assert_eq!(portals[0], start);
+    /// assert_eq!(*portals.last().unwrap(), goal);
+    /// ```
+    pub fn plan_portals(&self, start: Point, goal: Point) -> Option<Vec<Point>> {
+        if !self.in_bounds(start) || !self.in_bounds(goal) {
+            return None;
+        }
+
+        if start == goal || self.same_chunk(start, goal) {
+            return Some(vec![start, goal]);
+        }
+
+        let nearest_node_of_chunk = |pos: Point| -> Option<NodeID> {
+            let mut best: Option<(usize, NodeID)> = None;
+            for id in self.get_chunk(pos).nodes.iter() {
+                let h = self.neighborhood.heuristic(pos, self.nodes[*id].pos);
+                let better = match best {
+                    None => true,
+                    Some((bh, bid)) => h < bh || (h == bh && *id < bid),
+                };
+                if better {
+                    best = Some((h, *id));
+                }
+            }
+            best.map(|(_, id)| id)
+        };
+
+        let start_id = nearest_node_of_chunk(start)?;
+        let goal_id = nearest_node_of_chunk(goal)?;
+
+        if start_id == goal_id {
+            return Some(vec![start, self.nodes[goal_id].pos, goal]);
+        }
+
+        let path = graph::a_star_search(
+            &self.nodes,
+            start_id,
+            goal_id,
+            &self.neighborhood,
+            self.nodes.len(),
+        )?;
+
+        let mut portals = Vec::with_capacity(path.len() + 2);
+        portals.push(start);
+        portals.extend(path.iter().copied().map(|id| self.nodes[id].pos));
+        portals.push(goal);
+        portals.dedup();
+        Some(portals)
+    }
+
     fn find_nearest_node(
         &self,
         pos: Point,
@@ -1323,6 +1492,7 @@ impl<N: Neighborhood + Sync> PathCache<N> {
         paths: &NodeIDMap<Path<NodeID>>,
         mut get_cost: impl FnMut(Point) -> isize,
         out: &mut PointMap<AbstractPath<N>>,
+        mut portals: Option<&mut PointMap<Vec<Point>>>,
     ) {
         // a map for direct paths from the start to other nodes in the same chunk as start.
         // see `start_path` calculation below
@@ -1345,6 +1515,9 @@ impl<N: Neighborhood + Sync> PathCache<N> {
                     .expect("Inconsistency in Pathfinding");
 
                 out.insert(*goal, res);
+                if let Some(portals) = portals.as_mut() {
+                    portals.insert(*goal, vec![start, *goal]);
+                }
                 continue;
             }
 
@@ -1387,6 +1560,9 @@ impl<N: Neighborhood + Sync> PathCache<N> {
                                 new_start_path.clone(),
                             ),
                         );
+                        if let Some(portals) = portals.as_mut() {
+                            portals.insert(*goal, vec![start, *goal]);
+                        }
                         continue;
                     }
 
@@ -1432,6 +1608,15 @@ impl<N: Neighborhood + Sync> PathCache<N> {
 
             if let Some(path) = goal_path {
                 final_path.add_path(path);
+            }
+
+            if let Some(portals) = portals.as_mut() {
+                let mut plist: Vec<Point> = Vec::with_capacity(path.len() + 2);
+                plist.push(start);
+                plist.extend(path.iter().map(|&id| self.nodes[id].pos));
+                plist.push(*goal);
+                plist.dedup();
+                portals.insert(*goal, plist);
             }
 
             out.insert(*goal, final_path);
@@ -1557,6 +1742,88 @@ impl<'a, N: Neighborhood> NodeInspector<'a, N> {
             .edges
             .iter()
             .map(move |(id, path)| (NodeInspector::new(self.src, *id), path.cost()))
+    }
+}
+
+#[cfg(feature = "serialize")]
+impl<N: Neighborhood + Sync + serde::Serialize + serde::de::DeserializeOwned> PathCache<N> {
+    /// Serializes the entire `PathCache` into a versioned byte blob.
+    ///
+    /// Requires the cargo feature `serialize`.
+    ///
+    /// The layout is: the 4 magic bytes `HPAG`, a `u8` format version
+    /// (currently `1`), then a `bincode` payload of the cache itself.
+    /// [`from_bytes`](PathCache::from_bytes) checks the version on read and
+    /// rejects anything it cannot parse.
+    ///
+    /// The neighborhood type is part of the `PathCache` type, so the reader
+    /// must use the exact same `N` that was written. Note that a cache
+    /// created with [`cache_paths`](PathCacheConfig::cache_paths) set to
+    /// `false` stores its segments as `Unknown`, so the reader still needs
+    /// the real cost function to resolve them.
+    ///
+    /// ```
+    /// # use hierarchical_pathfinding::prelude::*;
+    /// # type Grid = [[isize; 8]; 8];
+    /// # let grid: &'static Grid = Box::leak(Box::new([[1isize; 8]; 8]));
+    /// # fn cost_fn(grid: &'static Grid) -> impl Sync + Fn((usize, usize)) -> isize {
+    /// #     move |(x, y)| grid[y][x]
+    /// # }
+    /// let cache = PathCache::new(
+    ///     (8, 8),
+    ///     cost_fn(grid),
+    ///     ManhattanNeighborhood::new(8, 8),
+    ///     PathCacheConfig::with_chunk_size(4),
+    /// );
+    ///
+    /// let bytes = cache.to_bytes();
+    /// assert_eq!(&bytes[..4], b"HPAG");
+    /// assert_eq!(bytes[4], 1);
+    ///
+    /// let restored: PathCache<ManhattanNeighborhood> = PathCache::from_bytes(&bytes).unwrap();
+    /// assert_eq!(restored.config().chunk_size, 4);
+    /// ```
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ser::HPA_HEADER_LEN + 1024);
+        out.extend_from_slice(ser::HPA_MAGIC);
+        out.push(ser::HPA_VERSION);
+        out.extend_from_slice(
+            &bincode::serialize(self).expect("PathCache serialization should never fail"),
+        );
+        out
+    }
+
+    /// Deserializes a `PathCache` from a blob written by
+    /// [`to_bytes`](PathCache::to_bytes).
+    ///
+    /// Requires the cargo feature `serialize`.
+    ///
+    /// The input is validated in this order: length (at least the 5-byte
+    /// header, otherwise `TooShort`), magic bytes (otherwise `BadMagic`),
+    /// format version (otherwise `UnsupportedVersion`, carrying the version
+    /// byte found), and finally the `bincode` payload (otherwise `Corrupt`).
+    /// No input causes a panic.
+    ///
+    /// ```
+    /// # use hierarchical_pathfinding::prelude::*;
+    /// let err = PathCache::<ManhattanNeighborhood>::from_bytes(b"no").unwrap_err();
+    /// assert_eq!(err, HpaSerError::TooShort);
+    ///
+    /// let err = PathCache::<ManhattanNeighborhood>::from_bytes(b"nope!").unwrap_err();
+    /// assert_eq!(err, HpaSerError::BadMagic);
+    /// ```
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HpaSerError> {
+        if bytes.len() < ser::HPA_HEADER_LEN {
+            return Err(HpaSerError::TooShort);
+        }
+        if bytes[..ser::HPA_MAGIC.len()] != *ser::HPA_MAGIC {
+            return Err(HpaSerError::BadMagic);
+        }
+        let version = bytes[ser::HPA_MAGIC.len()];
+        if version != ser::HPA_VERSION {
+            return Err(HpaSerError::UnsupportedVersion(version));
+        }
+        bincode::deserialize(&bytes[ser::HPA_HEADER_LEN..]).map_err(|_| HpaSerError::Corrupt)
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::{path::PathSegment, NodeIDMap, Point};
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct Node {
     pub pos: Point,
     pub walk_cost: usize,
